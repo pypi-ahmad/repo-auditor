@@ -1,0 +1,11 @@
+.env
+.venv/
+data/*
+!data/fixtures/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.streamlit/cache/
+*.log
+.codegraph/
+.code-review-graph/
