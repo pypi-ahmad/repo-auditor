@@ -1,29 +1,30 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+set "STREAMLIT_PORT=8594"
 
 if not exist ".env" (
-    if exist ".env.example" (
-        copy ".env.example" ".env" >nul
-        echo [.env] File created from .env.example. Opening in Notepad...
-        start /wait notepad .env
-        echo Please review .env and re-run run.cmd.
-        exit /b 0
-    )
+    copy ".env.example" ".env" >nul
+    start "" /wait notepad.exe ".env"
+    exit /b 0
 )
 
 if not exist ".venv" (
-    echo [.venv] Creating virtual environment with py -3...
     py -3 -m venv .venv
-    if errorlevel 1 (
-        echo [WARN] py -3 failed, falling back to python...
-        python -m venv .venv
-    )
+    if errorlevel 1 exit /b 1
 )
 
-call .venv\Scripts\activate.bat
-echo [pip] Installing requirements...
-pip install -r requirements.txt
+.venv\Scripts\pip install -r requirements.txt
+if errorlevel 1 exit /b 1
 
-echo [streamlit] Starting Streamlit app...
-streamlit run app.py
+set "STOPPED_LISTENER="
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":%STREAMLIT_PORT% .*LISTENING"') do (
+    echo Stopping the existing listener on port %STREAMLIT_PORT% (PID %%P)...
+    taskkill /PID %%P /F >nul 2>&1
+    set "STOPPED_LISTENER=1"
+)
+
+if defined STOPPED_LISTENER timeout /t 1 /nobreak >nul
+
+echo Starting Repo Auditor at http://localhost:%STREAMLIT_PORT%
+.venv\Scripts\streamlit run app.py --server.port %STREAMLIT_PORT%
