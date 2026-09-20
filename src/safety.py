@@ -1,20 +1,22 @@
 """Path safety and boundary enforcement for repo-auditor."""
 
 from pathlib import Path
-from typing import Tuple
 
 
-def validate_repo_path(raw_path: str) -> Tuple[bool, str, Path | None]:
+def validate_repo_path(raw_path: str) -> tuple[bool, str, Path | None]:
     """Validate user-entered repository path.
 
     Enforces:
     1. Non-empty string.
     2. Path exists and is a directory.
     3. Not a root drive (e.g. C:\\, D:\\, /).
-    4. Is a valid git repository or contains .git directory.
+    4. Parent traversal may only resolve back to the same starting directory.
+
+    Args:
+        raw_path: User-entered local directory path.
 
     Returns:
-        (is_valid, error_or_success_message, resolved_path)
+        A tuple of validity, a user-safe status message, and the resolved safe root when valid.
     """
     clean_str = raw_path.strip()
     if not clean_str:
@@ -25,6 +27,17 @@ def validate_repo_path(raw_path: str) -> Tuple[bool, str, Path | None]:
     except Exception as exc:
         return False, f"Invalid path syntax: {exc}", None
 
+    normalized_parts = clean_str.replace("/", "\\").split("\\")
+    if ".." in normalized_parts:
+        first_parent = normalized_parts.index("..")
+        starting_path = "\\".join(normalized_parts[:first_parent])
+        try:
+            starting_root = Path(starting_path).resolve()
+        except Exception as exc:
+            return False, f"Invalid traversal prefix: {exc}", None
+        if resolved != starting_root:
+            return False, "Parent-directory traversal escapes the selected root.", None
+
     if not resolved.exists():
         return False, f"Path does not exist: {resolved}", None
 
@@ -34,18 +47,45 @@ def validate_repo_path(raw_path: str) -> Tuple[bool, str, Path | None]:
     # Check for drive root or root directory
     # On Windows: Path("D:\\").anchor == "D:\\" and len(parts) == 1
     if resolved == Path(resolved.anchor) or len(resolved.parts) <= 1:
-        return False, f"Refusing to scan drive root ({resolved}). Provide a specific repository folder.", None
+        return (
+            False,
+            f"Refusing to scan drive root ({resolved}). Provide a specific repository folder.",
+            None,
+        )
 
-    # Git repository check
-    git_dir = resolved / ".git"
-    if not git_dir.exists():
-        return False, f"Directory is not a git repository (missing .git): {resolved}", None
+    mode = "Git repository" if (resolved / ".git").exists() else "folder"
+    return True, f"Path is a valid {mode}.", resolved
 
-    return True, "Path is valid.", resolved
+
+def validate_relative_path(raw_path: str) -> tuple[bool, str]:
+    """Reject absolute and parent-traversing file or glob inputs.
+
+    Args:
+        raw_path: Candidate path relative to a previously selected root.
+
+    Returns:
+        A validity flag and a user-safe explanation.
+    """
+    cleaned = raw_path.strip().replace("\\", "/")
+    if not cleaned:
+        return False, "Path cannot be empty."
+    if Path(cleaned).is_absolute() or (len(cleaned) >= 2 and cleaned[1] == ":"):
+        return False, "Absolute paths are not allowed; use a path relative to the selected root."
+    if ".." in cleaned.split("/"):
+        return False, "Parent-directory traversal ('..') is not allowed."
+    return True, "Path is relative to the selected root."
 
 
 def is_safe_child_path(root_path: Path, target_path: Path) -> bool:
-    """Ensure target_path resolves strictly within root_path, preventing path traversal."""
+    """Ensure a resolved target remains within a resolved root path.
+
+    Args:
+        root_path: Selected repository boundary.
+        target_path: Candidate file or directory to inspect.
+
+    Returns:
+        ``True`` only when resolution keeps the target inside the root.
+    """
     try:
         resolved_root = root_path.resolve()
         resolved_target = target_path.resolve()
