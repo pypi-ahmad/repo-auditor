@@ -1,37 +1,62 @@
-"""File gathering, AST import expansion, and repository packaging logic."""
+"""Bounded repository packer with read-only Git diff and one-hop imports."""
 
-from dataclasses import dataclass, field
 import json
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+
 import git
 
-from src.ast_resolver import get_local_imports_for_file
-from src.safety import is_safe_child_path
+from src.imports_hop import resolve_one_hop
+from src.safety import is_safe_child_path, validate_repo_path
 
-BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".bmp", ".webp",
-    ".exe", ".dll", ".so", ".dylib", ".bin", ".iso", ".msi",
-    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".whl",
-    ".pyc", ".pyd", ".pyo", ".db", ".sqlite", ".sqlite3",
-    ".pdf", ".docx", ".xlsx", ".pptx", ".parquet", ".arrow",
-}
-
-DEFAULT_SKIP_DIRS = {
-    ".git", ".venv", "venv", "node_modules", "__pycache__", ".idea", ".vscode", "data"
-}
+APP_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_PACK_CACHE = APP_ROOT / "data" / "cache" / "last_pack.json"
+TEXT_EXTENSIONS = {".py", ".md", ".txt", ".toml"}
+SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__"}
 
 
 @dataclass
 class ManifestItem:
+    """One candidate file's inclusion decision.
+
+    Attributes:
+        path: Root-relative path or a rejected external path.
+        bytes: File size observed before packing.
+        included: Whether the file contributed to the pack text.
+        reason: Selection, exclusion, or truncation explanation.
+    """
+
     path: str
     bytes: int
-    status: str  # "included" or "skipped"
+    included: bool
     reason: str
+
+    @property
+    def status(self) -> str:
+        """Return the legacy string status used by existing UI and smoke checks.
+
+        Returns:
+            ``"included"`` or ``"skipped"`` according to ``included``.
+        """
+        return "included" if self.included else "skipped"
 
 
 @dataclass
 class PackedFile:
+    """Text content and provenance for a file included in a repository pack.
+
+    Attributes:
+        rel_path: Path relative to the selected root.
+        size_bytes: Original file size before truncation.
+        lines: Number of included text lines.
+        content: Included text, potentially truncated by the pack budget.
+        extension: Lowercase filename extension.
+        is_diff_match: Whether Git diff selection chose this file.
+        is_ast_import: Whether one-hop import expansion chose this file.
+        imported_by: Root-relative file that caused the import expansion.
+    """
+
     rel_path: str
     size_bytes: int
     lines: int
@@ -44,311 +69,317 @@ class PackedFile:
 
 @dataclass
 class PackResult:
+    """Bounded pack, manifest, and metadata used by the Streamlit workflow.
+
+    Attributes:
+        repo_path: Resolved selected root.
+        is_git: Whether the root contains Git metadata.
+        ref_or_glob: Requested Git range or folder-scan descriptor.
+        budget_chars: Maximum permitted pack-text size.
+        files: Text files included in the pack.
+        manifest: Inclusion decisions for candidate files.
+        one_hop_links: Local import edges used for expansion.
+        pack_text: Header-delimited text sent to audit passes.
+        git_error: Read-only Git failure retained when folder fallback was used.
+    """
+
     repo_path: Path
     is_git: bool
     ref_or_glob: str
-    char_cap: int
-    files: List[PackedFile] = field(default_factory=list)
-    manifest: List[ManifestItem] = field(default_factory=list)
-    one_hop_links: Dict[str, List[str]] = field(default_factory=dict)
+    budget_chars: int
+    files: list[PackedFile] = field(default_factory=list)
+    manifest: list[ManifestItem] = field(default_factory=list)
+    one_hop_links: dict[str, list[str]] = field(default_factory=dict)
+    pack_text: str = ""
+    git_error: str = ""
+
+    @property
+    def char_cap(self) -> int:
+        """Return the compatibility name for the configured character budget.
+
+        Returns:
+            Maximum characters allowed in ``pack_text``.
+        """
+        return self.budget_chars
 
     @property
     def total_files(self) -> int:
+        """Return the number of files included in the pack."""
         return len(self.files)
 
     @property
     def total_bytes(self) -> int:
-        return sum(f.size_bytes for f in self.files)
+        """Return original byte sizes summed across packed files."""
+        return sum(item.size_bytes for item in self.files)
 
     @property
     def total_lines(self) -> int:
-        return sum(f.lines for f in self.files)
+        """Return included text lines summed across packed files."""
+        return sum(item.lines for item in self.files)
 
     @property
     def total_chars(self) -> int:
-        return sum(len(f.content) for f in self.files)
+        """Return the exact character count of the bounded pack text."""
+        return len(self.pack_text)
 
     @property
     def token_estimate(self) -> int:
+        """Return the app's coarse four-characters-per-token estimate."""
         return self.total_chars // 4
 
 
-def is_binary_content(sample_bytes: bytes) -> bool:
-    """Detect if raw sample bytes indicate binary content."""
-    return b"\x00" in sample_bytes
+def _walk_supported(root: Path) -> list[Path]:
+    """Walk supported text files without following links or excluded directories.
+
+    Args:
+        root: Resolved selected repository root.
+
+    Returns:
+        Candidate paths with a supported extension, before budget enforcement.
+    """
+    paths: list[Path] = []
+    for current, dirs, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        dirs[:] = sorted(
+            directory
+            for directory in dirs
+            if directory.lower() not in SKIP_DIRS
+            and is_safe_child_path(root, current_path / directory)
+        )
+        for filename in sorted(files):
+            path = current_path / filename
+            if path.suffix.lower() in TEXT_EXTENSIONS:
+                paths.append(path)
+    return paths
 
 
-def resolve_git_ref(repo: git.Repo, user_ref: Optional[str] = None) -> Tuple[str, List[str]]:
-    """Resolves target git ref and returns (resolved_ref_name, list_of_changed_files)."""
-    # 1. User-supplied ref
-    if user_ref and user_ref.strip():
-        ref = user_ref.strip()
-        try:
-            diff_out = repo.git.diff(ref, name_only=True)
-            return ref, [l.strip() for l in diff_out.splitlines() if l.strip()]
-        except Exception:
-            pass
+def _git_diff_paths(root: Path, refs: str) -> list[Path]:
+    """Return root-relative paths from a read-only Git diff.
 
-    # 2. origin/HEAD
+    Args:
+        root: Git repository root.
+        refs: Exactly one ``base..head`` revision range.
+
+    Returns:
+        Candidate paths named by ``git diff --name-only``.
+
+    Raises:
+        ValueError: If refs do not have safe ``base..head`` syntax.
+        git.GitCommandError: If Git cannot resolve or diff the requested commits.
+    """
+    if refs.count("..") != 1 or any(char.isspace() for char in refs):
+        raise ValueError("Git refs must use base..head syntax.")
+    base_name, head_name = refs.split("..", 1)
+    if not base_name or not head_name or base_name.startswith("-") or head_name.startswith("-"):
+        raise ValueError("Git refs must use base..head syntax.")
+
+    repo = git.Repo(root, search_parent_directories=False)
+    base = repo.commit(base_name).hexsha
+    head = repo.commit(head_name).hexsha
+    diff_range = f"{base}..{head}"
+    names = repo.git.diff(diff_range, name_only=True).splitlines()
+    return [root / name.strip() for name in names if name.strip()]
+
+
+def _safe_relative(root: Path, path: Path) -> str | None:
+    """Convert a candidate to a slash-normalized path only when it stays in root."""
     try:
-        repo.git.rev_parse("origin/HEAD")
-        diff_out = repo.git.diff("origin/HEAD", name_only=True)
-        return "origin/HEAD", [l.strip() for l in diff_out.splitlines() if l.strip()]
-    except Exception:
-        pass
+        resolved = path.resolve()
+        return resolved.relative_to(root.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return None
 
-    # 3. HEAD~1
+
+def _is_binary(path: Path) -> bool:
+    """Detect binary content conservatively from the first bytes of a file."""
     try:
-        repo.git.rev_parse("HEAD~1")
-        diff_out = repo.git.diff("HEAD~1", name_only=True)
-        return "HEAD~1", [l.strip() for l in diff_out.splitlines() if l.strip()]
-    except Exception:
-        pass
-
-    # 4. Fallback to uncommitted changes vs HEAD
-    try:
-        diff_out = repo.git.diff("HEAD", name_only=True)
-        files = [l.strip() for l in diff_out.splitlines() if l.strip()]
-        if files:
-            return "HEAD (working diff)", files
-    except Exception:
-        pass
-
-    # 5. If no diff vs ref exists (e.g. brand new repository), fallback to all tracked files
-    try:
-        tracked = [l.strip() for l in repo.git.ls_files().splitlines() if l.strip()]
-        return "all-tracked (initial commit)", tracked
-    except Exception:
-        return "none", []
+        with path.open("rb") as handle:
+            return b"\x00" in handle.read(4096)
+    except OSError:
+        return True
 
 
-def save_pack_cache(result: PackResult, cache_path: Optional[Path] = None) -> Path:
-    """Saves pack manifest and metadata to data/cache/last_pack.json."""
-    target = cache_path or Path("data/cache/last_pack.json")
+def _pack_piece(relative: str, content: str, remaining: int) -> tuple[str, str, bool]:
+    """Add file delimiters and truncate text to the remaining character budget."""
+    header = f"===== FILE: {relative} =====\n"
+    footer = f"\n===== END FILE: {relative} =====\n"
+    full = f"{header}{content}{footer}"
+    if len(full) <= remaining:
+        return full, content, False
+    if remaining <= len(header):
+        return "", "", False
+    content_part = content[: remaining - len(header)]
+    return f"{header}{content_part}", content_part, True
+
+
+def save_pack_cache(result: PackResult, cache_path: Path | None = None) -> Path:
+    """Write the manifest and bounded pack text under the app cache directory.
+
+    Args:
+        result: Completed bounded pack to serialize.
+        cache_path: Optional explicit cache target for tests or controlled callers.
+
+    Returns:
+        Path that received the JSON cache payload.
+    """
+    target = cache_path or DEFAULT_PACK_CACHE
     target.parent.mkdir(parents=True, exist_ok=True)
-
     payload = {
-        "repo_path": str(result.repo_path),
-        "is_git": result.is_git,
-        "ref_or_glob": result.ref_or_glob,
-        "char_cap": result.char_cap,
+        "root": str(result.repo_path),
+        "git_refs": result.ref_or_glob if result.is_git else None,
+        "budget_chars": result.budget_chars,
         "total_files": result.total_files,
-        "total_lines": result.total_lines,
         "total_chars": result.total_chars,
-        "total_bytes": result.total_bytes,
-        "one_hop_links": result.one_hop_links,
         "manifest": [
             {
                 "path": item.path,
                 "bytes": item.bytes,
-                "status": item.status,
+                "included": item.included,
                 "reason": item.reason,
             }
             for item in result.manifest
         ],
-        "files": [
-            {
-                "rel_path": f.rel_path,
-                "bytes": f.size_bytes,
-                "lines": f.lines,
-                "is_diff_match": f.is_diff_match,
-                "is_ast_import": f.is_ast_import,
-                "imported_by": f.imported_by,
-            }
-            for f in result.files
-        ],
+        "pack_text": result.pack_text,
+        "git_error": result.git_error,
     }
-
     target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return target
 
 
 def pack_repository(
-    repo_path_str: str,
-    user_ref: Optional[str] = None,
-    non_git_glob: Optional[str] = None,
-    explicit_files: Optional[List[str]] = None,
-    file_cap: int = 50,
-    char_cap: int = 120_000,
-    max_size_kb: int = 500,
+    root_path: str,
+    git_refs: str | None = None,
+    budget_chars: int = 80_000,
+    max_files: int = 40,
+    *,
     auto_cache: bool = True,
-) -> Tuple[bool, str, Optional[PackResult]]:
-    """Gathers repository files with one-hop AST local import expansion and character cap."""
-    clean_path_str = repo_path_str.strip()
-    if not clean_path_str:
-        return False, "Repository path cannot be empty.", None
+) -> tuple[bool, str, PackResult | None]:
+    """Pack bounded text files and their direct local Python imports.
 
-    repo_path = Path(clean_path_str).resolve()
-    if not repo_path.exists() or not repo_path.is_dir():
-        return False, f"Directory does not exist: {repo_path}", None
+    Args:
+        root_path: User-selected local directory.
+        git_refs: Optional ``base..head`` range for a read-only Git diff.
+        budget_chars: Maximum characters in the generated pack text.
+        max_files: Maximum files that may be included.
+        auto_cache: Whether to write ``last_pack.json`` after a successful pack.
 
-    # Refuse drive root
-    if repo_path == Path(repo_path.anchor) or len(repo_path.parts) <= 1:
-        return False, f"Refusing to scan drive root ({repo_path}).", None
+    Returns:
+        Success flag, user-safe status message, and the pack result when successful. Git failures
+        retain their error on the result and use a bounded folder-scan fallback.
+    """
+    valid, message, root = validate_repo_path(root_path)
+    if not valid or root is None:
+        return False, message, None
+    if budget_chars < 1:
+        return False, "budget_chars must be positive.", None
+    if max_files < 1:
+        return False, "max_files must be positive.", None
 
-    is_git = (repo_path / ".git").exists()
-    manifest: List[ManifestItem] = []
-    initial_candidates: List[Tuple[str, str]] = []  # (rel_path, source_reason)
-    target_ref_or_glob = ""
-
-    # 1. Explicit file list if provided
-    if explicit_files:
-        target_ref_or_glob = "explicit file list"
-        for item in explicit_files:
-            clean_item = item.strip().replace("\\", "/")
-            if clean_item:
-                initial_candidates.append((clean_item, "Explicit file candidate"))
-
-    # 2. Git mode when .git exists and no explicit file list provided
-    elif is_git:
+    is_git = (root / ".git").exists()
+    git_error = ""
+    selection_reason = "root scan"
+    if is_git and git_refs:
         try:
-            repo = git.Repo(repo_path)
-            ref_name, changed_files = resolve_git_ref(repo, user_ref)
-            target_ref_or_glob = ref_name
-
-            # Include untracked files as well
-            untracked = list(repo.untracked_files)
-            combined_initial = list(dict.fromkeys(changed_files + untracked))
-
-            for f in combined_initial:
-                reason = f"Changed vs {ref_name}" if f in changed_files else "Untracked file"
-                initial_candidates.append((f, reason))
-        except Exception as exc:
-            return False, f"Git inspection failed: {exc}", None
-
-    # 3. Non-git directory: glob pattern with file cap
+            initial_paths = _git_diff_paths(root, git_refs)
+            selection_reason = "git diff"
+        except (ValueError, git.BadName, git.GitCommandError, git.InvalidGitRepositoryError) as exc:
+            git_error = f"Git diff failed: {exc}"
+            initial_paths = _walk_supported(root)
+            selection_reason = "folder fallback after git error"
     else:
-        glob_pattern = non_git_glob.strip() if non_git_glob else "**/*.py"
-        target_ref_or_glob = glob_pattern
-        try:
-            matched_paths = list(repo_path.glob(glob_pattern))
-            for p in matched_paths:
-                if p.is_file() and is_safe_child_path(repo_path, p):
-                    rel = p.relative_to(repo_path).as_posix()
-                    initial_candidates.append((rel, f"Matched glob '{glob_pattern}'"))
-                    if len(initial_candidates) >= file_cap:
-                        break
-        except Exception as exc:
-            return False, f"Glob evaluation '{glob_pattern}' failed: {exc}", None
+        initial_paths = _walk_supported(root)
 
-    # One-hop AST local import resolution for Python files
-    expanded_candidates: List[Tuple[str, str, str]] = []  # (rel_path, reason, imported_by)
-    visited_rel_paths: Set[str] = set()
-    one_hop_links: Dict[str, List[str]] = {}
+    candidates: list[tuple[Path, str, str]] = []
+    seen: set[str] = set()
+    one_hop_links: dict[str, list[str]] = {}
+    for path in initial_paths:
+        relative = _safe_relative(root, path)
+        key = relative or str(path)
+        if key not in seen:
+            seen.add(key)
+            candidates.append((path, selection_reason, ""))
 
-    for rel_path, reason in initial_candidates:
-        clean_rel = rel_path.replace("\\", "/").strip()
-        if clean_rel not in visited_rel_paths:
-            visited_rel_paths.add(clean_rel)
-            expanded_candidates.append((clean_rel, reason, ""))
+        if relative and path.suffix.lower() == ".py":
+            imports = resolve_one_hop(path, root)
+            for imported in imports:
+                imported_relative = imported.relative_to(root).as_posix()
+                one_hop_links.setdefault(relative, []).append(imported_relative)
+                if imported_relative not in seen:
+                    seen.add(imported_relative)
+                    candidates.append((imported, f"one-hop import from {relative}", relative))
 
-            # If Python file, resolve one-hop local imports
-            full_path = (repo_path / clean_rel).resolve()
-            if full_path.suffix.lower() == ".py" and full_path.is_file():
-                local_deps = get_local_imports_for_file(full_path, repo_path)
-                for dep in local_deps:
-                    dep_rel = dep.relative_to(repo_path).as_posix()
-                    one_hop_links.setdefault(clean_rel, []).append(dep_rel)
-                    if dep_rel not in visited_rel_paths:
-                        visited_rel_paths.add(dep_rel)
-                        expanded_candidates.append(
-                            (dep_rel, f"One-hop AST import from {clean_rel}", clean_rel)
-                        )
+    manifest: list[ManifestItem] = []
+    packed_files: list[PackedFile] = []
+    pack_parts: list[str] = []
+    used_chars = 0
 
-    # Process and pack candidate files respecting char_cap and max_size_kb
-    packed_files: List[PackedFile] = []
-    current_total_chars = 0
-    max_bytes = max_size_kb * 1024
-
-    for rel_path, reason, imported_by in expanded_candidates:
-        full_path = (repo_path / rel_path).resolve()
-
-        if not is_safe_child_path(repo_path, full_path):
-            manifest.append(ManifestItem(path=rel_path, bytes=0, status="skipped", reason="Path traversal outside root"))
+    for path, reason, imported_by in candidates:
+        relative = _safe_relative(root, path)
+        if relative is None:
+            manifest.append(ManifestItem(str(path), 0, False, "outside selected root"))
             continue
-
-        if not full_path.exists() or not full_path.is_file():
-            manifest.append(ManifestItem(path=rel_path, bytes=0, status="skipped", reason="File missing or not regular file"))
+        if len(packed_files) >= max_files:
+            size = path.stat().st_size if path.is_file() else 0
+            manifest.append(ManifestItem(relative, size, False, "max_files reached"))
             continue
-
-        parts = full_path.relative_to(repo_path).parts
-        if any(skip in parts for skip in DEFAULT_SKIP_DIRS):
-            manifest.append(ManifestItem(path=rel_path, bytes=0, status="skipped", reason="Ignored directory"))
+        if not path.is_file():
+            manifest.append(ManifestItem(relative, 0, False, "missing or not a file"))
             continue
-
-        ext = full_path.suffix.lower()
-        if ext in BINARY_EXTENSIONS:
-            manifest.append(ManifestItem(path=rel_path, bytes=full_path.stat().st_size, status="skipped", reason=f"Binary extension ({ext})"))
-            continue
-
-        size = full_path.stat().st_size
-        if size > max_bytes:
-            manifest.append(ManifestItem(path=rel_path, bytes=size, status="skipped", reason=f"Exceeds max file size ({size/1024:.1f} KB > {max_size_kb} KB)"))
-            continue
-
-        # Read content
-        try:
-            with open(full_path, "rb") as f:
-                sample = f.read(2048)
-                if is_binary_content(sample):
-                    manifest.append(ManifestItem(path=rel_path, bytes=size, status="skipped", reason="Binary content detected"))
-                    continue
-                f.seek(0)
-                raw = f.read()
-
-            try:
-                content = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                content = raw.decode("latin-1")
-
-            # Check character cap
-            file_char_count = len(content)
-            if current_total_chars + file_char_count > char_cap:
-                manifest.append(
-                    ManifestItem(
-                        path=rel_path,
-                        bytes=size,
-                        status="skipped",
-                        reason=f"Exceeds character cap ({current_total_chars + file_char_count:,} > {char_cap:,})",
-                    )
-                )
-                continue
-
-            current_total_chars += file_char_count
-            lines = len(content.splitlines())
-
-            packed_files.append(
-                PackedFile(
-                    rel_path=rel_path,
-                    size_bytes=size,
-                    lines=lines,
-                    content=content,
-                    extension=ext,
-                    is_diff_match=("Changed" in reason or "Untracked" in reason or "Explicit" in reason),
-                    is_ast_import=bool(imported_by),
-                    imported_by=imported_by,
-                )
+        if path.suffix.lower() not in TEXT_EXTENSIONS:
+            manifest.append(
+                ManifestItem(relative, path.stat().st_size, False, "unsupported file type")
             )
-            manifest.append(ManifestItem(path=rel_path, bytes=size, status="included", reason=reason))
+            continue
+        if _is_binary(path):
+            manifest.append(ManifestItem(relative, path.stat().st_size, False, "binary content"))
+            continue
 
-        except Exception as exc:
-            manifest.append(ManifestItem(path=rel_path, bytes=size, status="skipped", reason=f"Read error: {exc}"))
+        size = path.stat().st_size
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            manifest.append(ManifestItem(relative, size, False, f"read error: {exc}"))
+            continue
+
+        piece, packed_content, truncated = _pack_piece(relative, content, budget_chars - used_chars)
+        if not piece:
+            manifest.append(ManifestItem(relative, size, False, "budget_chars reached"))
+            continue
+
+        pack_parts.append(piece)
+        used_chars += len(piece)
+        packed_files.append(
+            PackedFile(
+                rel_path=relative,
+                size_bytes=size,
+                lines=len(packed_content.splitlines()),
+                content=packed_content,
+                extension=path.suffix.lower(),
+                is_diff_match=reason == "git diff",
+                is_ast_import=bool(imported_by),
+                imported_by=imported_by,
+            )
+        )
+        included_reason = f"{reason}; truncated to budget" if truncated else reason
+        manifest.append(ManifestItem(relative, size, True, included_reason))
 
     result = PackResult(
-        repo_path=repo_path,
+        repo_path=root,
         is_git=is_git,
-        ref_or_glob=target_ref_or_glob,
-        char_cap=char_cap,
+        ref_or_glob=git_refs or "all supported files",
+        budget_chars=budget_chars,
         files=packed_files,
         manifest=manifest,
         one_hop_links=one_hop_links,
+        pack_text="".join(pack_parts),
+        git_error=git_error,
     )
-
     if auto_cache:
         save_pack_cache(result)
+    message = f"Packed {result.total_files} files ({result.total_chars:,} chars)."
+    if git_error:
+        message = f"{message} Folder fallback used because {git_error}"
+    return True, message, result
 
-    return True, f"Packed {result.total_files} files ({result.total_chars:,} chars, cap: {char_cap:,}).", result
 
-
-# Backward-compatible alias
 gather_repo_files = pack_repository

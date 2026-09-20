@@ -2,15 +2,20 @@
 
 import ast
 from pathlib import Path
-from typing import List, Set
 
 from src.safety import is_safe_child_path
 
 
-def get_local_imports_for_file(file_path: Path, repo_root: Path) -> List[Path]:
-    """Parses a Python file with ast and resolves one-hop local module imports.
+def get_local_imports_for_file(file_path: Path, repo_root: Path) -> list[Path]:
+    """Parse a Python file with AST and resolve one-hop local module imports.
 
-    Returns a list of resolved existing Path objects strictly within repo_root.
+    Args:
+        file_path: Candidate Python file to inspect.
+        repo_root: Selected root that resolved imports must not escape.
+
+    Returns:
+        Existing resolved local files strictly inside ``repo_root``. Syntax errors and unreadable
+        files return an empty list.
     """
     if not file_path.exists() or file_path.suffix.lower() != ".py":
         return []
@@ -22,7 +27,7 @@ def get_local_imports_for_file(file_path: Path, repo_root: Path) -> List[Path]:
         # Syntax error or unparseable file
         return []
 
-    discovered_paths: Set[Path] = set()
+    discovered_paths: set[Path] = set()
     candidate_roots = [
         file_path.parent,
         repo_root,
@@ -36,18 +41,24 @@ def get_local_imports_for_file(file_path: Path, repo_root: Path) -> List[Path]:
 
         if isinstance(node, ast.Import):
             for alias in node.names:
-                _resolve_module(alias.name, 0, file_path, repo_root, candidate_roots, discovered_paths)
+                _resolve_module(
+                    alias.name, 0, file_path, repo_root, candidate_roots, discovered_paths
+                )
         elif isinstance(node, ast.ImportFrom):
             level = node.level or 0
             module_name = node.module or ""
-            _resolve_module(module_name, level, file_path, repo_root, candidate_roots, discovered_paths)
+            _resolve_module(
+                module_name, level, file_path, repo_root, candidate_roots, discovered_paths
+            )
             # Also check if imported names in `from X import Y` correspond to `X/Y.py`
             for alias in node.names:
                 sub_mod = f"{module_name}.{alias.name}" if module_name else alias.name
-                _resolve_module(sub_mod, level, file_path, repo_root, candidate_roots, discovered_paths)
+                _resolve_module(
+                    sub_mod, level, file_path, repo_root, candidate_roots, discovered_paths
+                )
 
     # Filter to valid files strictly within repo_root, excluding the source file itself
-    resolved_files: List[Path] = []
+    resolved_files: list[Path] = []
     for p in sorted(discovered_paths):
         if p != file_path.resolve() and p.is_file() and is_safe_child_path(repo_root, p):
             resolved_files.append(p)
@@ -60,9 +71,19 @@ def _resolve_module(
     level: int,
     source_file: Path,
     repo_root: Path,
-    candidate_roots: List[Path],
-    found: Set[Path],
+    candidate_roots: list[Path],
+    found: set[Path],
 ) -> None:
+    """Resolve one absolute or relative import target into contained candidates.
+
+    Args:
+        module_name: Dotted module portion from an import statement.
+        level: Relative-import level, or zero for an absolute import.
+        source_file: File that contains the import.
+        repo_root: Selected root boundary.
+        candidate_roots: Directories considered for absolute imports.
+        found: Mutable set receiving resolved local files.
+    """
     if not module_name and level == 0:
         return
 
@@ -82,7 +103,8 @@ def _resolve_module(
             _check_candidates(root, rel_path_str, repo_root, found)
 
 
-def _check_candidates(base_dir: Path, rel_path_str: str, repo_root: Path, found: Set[Path]) -> None:
+def _check_candidates(base_dir: Path, rel_path_str: str, repo_root: Path, found: set[Path]) -> None:
+    """Add a contained module file or package initializer to ``found`` when present."""
     if not rel_path_str:
         return
 
